@@ -17,6 +17,9 @@ provider wiring a one-env-var swap away.
 from __future__ import annotations
 
 import os
+from typing import Optional
+
+from services import privacy
 
 DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-5",
@@ -66,15 +69,31 @@ def _call_openai(system: str, prompt: str) -> str:
 _PROVIDERS = {"anthropic": _call_anthropic, "openai": _call_openai}
 
 
-def complete(system: str, prompt: str, template_fallback: str) -> str:
+def complete(
+    system: str, prompt: str, template_fallback: str, record: Optional[dict] = None,
+) -> str:
     """Returns an LLM completion if a provider+key is configured, else the
     caller-supplied deterministic template string. Never raises — falls
     back to the template on any provider error so a flaky/misconfigured
-    key can't break the remediation loop."""
+    key can't break the remediation loop.
+
+    `record` (the current CorporateRecord snapshot, if the caller has one in
+    scope) activates a defense-in-depth privacy guard: the outbound
+    system/prompt and the inbound result are all scanned for the record's
+    actual beneficial_owner/tax_id values and redacted if found — see
+    services/privacy.py. This exists on top of already-PII-free prompt
+    templates so a future template regression is caught, not shipped."""
+    system = privacy.build_hardened_system_prompt(system)
+    system = privacy.redact_pii(system, record)
+    prompt = privacy.redact_pii(prompt, record)
+
     provider = _provider()
     if provider and is_configured():
         try:
-            return _PROVIDERS[provider](system, prompt)
+            result = _PROVIDERS[provider](system, prompt)
         except Exception as exc:  # noqa: BLE001 — deliberate broad fallback
-            return f"{template_fallback}\n\n[LLM call failed, showing template fallback: {exc}]"
-    return template_fallback
+            result = f"{template_fallback}\n\n[LLM call failed, showing template fallback: {exc}]"
+    else:
+        result = template_fallback
+
+    return privacy.redact_pii(result, record)

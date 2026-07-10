@@ -18,7 +18,7 @@ from events.types import DocumentUploaded, ExpiryReminder, ManualReviewCompleted
 from agents import human_review
 from graph import build as graph_build
 from migration import seed
-from services import config, db
+from services import config, db, validation
 from ui import components
 
 st.set_page_config(page_title="Corporate KYC Remediation Loop", layout="wide")
@@ -37,6 +37,11 @@ _ensure_seeded()
 
 # ------------------------------------------------------------ event handlers --
 def on_policy_updated(event: PolicyUpdated) -> dict:
+    # Defense-in-depth: revalidate even though the button handler already
+    # did, in case a future second publisher of PolicyUpdated bypasses the UI.
+    event.new_policy_version = validation.validate_policy_version(
+        event.new_policy_version, config.get_current_policy_version()
+    )
     config.set_current_policy_version(event.new_policy_version)
     affected = [r for r in db.list_records_with_metadata() if r["policy_version"] < event.new_policy_version]
     fanned_out = []
@@ -172,9 +177,16 @@ with t1:
         value=config.get_current_policy_version() + 1, step=1, key="policy_version_input",
     )
     if st.button("Publish PolicyUpdated"):
-        result = bus.publish(PolicyUpdated(new_policy_version=int(new_version)))[0]
-        st.success(f"Policy bumped to v{new_version}. {len(result['fanned_out'])} case(s) remediated.")
-        st.rerun()
+        try:
+            validated_version = validation.validate_policy_version(
+                new_version, config.get_current_policy_version()
+            )
+        except validation.ValidationError as exc:
+            st.error(str(exc))
+        else:
+            result = bus.publish(PolicyUpdated(new_policy_version=validated_version))[0]
+            st.success(f"Policy bumped to v{validated_version}. {len(result['fanned_out'])} case(s) remediated.")
+            st.rerun()
 
 with t2:
     st.markdown("**2. New Document Uploaded**")
@@ -241,14 +253,19 @@ if pending and pending["customer_id"] == selected_customer_id:
         key="rm_notes_input",
     )
     if st.button("Simulate customer response received -> Resume"):
-        bus.publish(ManualReviewCompleted(
-            customer_id=selected_customer_id, run_id=pending["run_id"], rm_notes=rm_notes,
-        ))
-        resolved_state = human_review.resolve_human_review(pending, rm_notes)
-        resume_nodes = list(graph_build.resume_remediation_stream(resolved_state))
-        combined = st.session_state["last_run_nodes"] + resume_nodes
-        _record_run(selected_customer_id, combined)
-        st.rerun()
+        try:
+            validated_notes = validation.validate_rm_notes(rm_notes)
+        except validation.ValidationError as exc:
+            st.error(str(exc))
+        else:
+            bus.publish(ManualReviewCompleted(
+                customer_id=selected_customer_id, run_id=pending["run_id"], rm_notes=validated_notes,
+            ))
+            resolved_state = human_review.resolve_human_review(pending, validated_notes)
+            resume_nodes = list(graph_build.resume_remediation_stream(resolved_state))
+            combined = st.session_state["last_run_nodes"] + resume_nodes
+            _record_run(selected_customer_id, combined)
+            st.rerun()
 
 
 # ---------------------------------------------------------------- audit trail --

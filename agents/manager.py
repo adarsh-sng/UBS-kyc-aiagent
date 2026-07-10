@@ -51,6 +51,7 @@ def manager_node(state: RemediationState) -> RemediationState:
         ),
         prompt=template,
         template_fallback=template,
+        record=state["record"],
     )
 
     state["assigned_manager"] = manager

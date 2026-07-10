@@ -20,7 +20,7 @@ from datetime import datetime
 
 from agents.audit import log_step
 from models.state import RemediationState
-from services import mock_sources
+from services import mock_sources, validation
 
 
 def human_review_node(state: RemediationState) -> RemediationState:
@@ -54,7 +54,12 @@ def resolve_human_review(state: RemediationState, rm_notes: str) -> RemediationS
     Stands in for: RM contacts the customer, customer supplies the missing
     information, RM confirms it. Mutates the cached state so the next graph
     invoke fast-forwards to re-verification.
+
+    Re-validates rm_notes independently of the UI layer (app.py already
+    validates before calling this) — defense-in-depth so this function is
+    safe to call from any future caller, not just the Streamlit button.
     """
+    rm_notes = validation.validate_rm_notes(rm_notes)
     gap = state["gap_event"]
     enrichment = state.get("enrichment_result") or {
         "updated_fields": {}, "confidence": 0.0, "evidence": {},

@@ -49,6 +49,7 @@ def communication_node(state: RemediationState) -> RemediationState:
         ),
         prompt=template,
         template_fallback=template,
+        record=state["record"],
     )
     state["client_message_draft"] = draft
     log_step(
