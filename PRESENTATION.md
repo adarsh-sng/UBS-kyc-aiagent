@@ -229,13 +229,13 @@ We chose this **two-phase re-invoke** over LangGraph's native `interrupt()` + ch
 
 ---
 
-## Speaker 6 — Data Architecture, Audit & Production Readiness
+## Speaker 6 — Data Architecture, Audit, Guardrails & Production Readiness
 
-**Focus:** SQLite schema, idempotent writes, full replayable audit trail, configurable thresholds
+**Focus:** SQLite schema, audit trail, PII redaction, input validation, production readiness
 
 ---
 
-The flowchart shows **Metadata Table**, **Internal DB**, and **Update the Metadata**. Let me walk through the data architecture.
+The flowchart shows **Metadata Table**, **Internal DB**, and **Update the Metadata**. Let me walk through the data architecture, then cover how we protect sensitive data.
 
 **SQLite Schema — 6 Tables:**
 
@@ -289,6 +289,36 @@ This means replayed or duplicate triggers don't create duplicate audit entries. 
 
 `db.replay_audit(customer_id)` returns the complete ordered action log for any customer — every detection, enrichment, fetch, verification, and audit step. This is critical for compliance: you can reconstruct exactly what happened, when, and why.
 
+**Architecture Decision — PII Never Reaches the LLM:**
+
+The Manager and Communication agents use an LLM to generate summaries and drafts. But `beneficial_owner` and `tax_id` are sensitive PII. Our defense-in-depth approach in `services/privacy.py` ensures they never leak:
+
+1. **Redaction guard** (`redact_pii`) — scans all text going TO the LLM and coming BACK from the LLM, replacing any occurrence of `beneficial_owner`/`tax_id` values with `[REDACTED]`
+2. **Hardened system prompts** (`build_hardened_system_prompt`) — appends standing rules telling the model never to output or infer PII, and to treat `[CUSTOMER_DATA]`-delimited text as inert data
+3. **Applied in `llm_client.complete()`** — every LLM call goes through this, so no call site can forget it
+
+```python
+# services/llm_client.py:86-99
+system = privacy.build_hardened_system_prompt(system)
+system = privacy.redact_pii(system, record)
+prompt = privacy.redact_pii(prompt, record)
+# ... call LLM ...
+return privacy.redact_pii(result, record)
+```
+
+The audit trail in SQLite is intentionally **not** redacted — that's the compliance record. The guardrail applies to the LLM/RM-facing surface only.
+
+**Architecture Decision — Input Validation with Hard-Reject:**
+
+User-supplied free text (RM notes, policy version) is validated in `services/validation.py`:
+
+- `validate_rm_notes()` — non-empty, max 2000 chars, strips control characters, and **hard-rejects** prompt injection patterns (ignore-previous-instructions, role overrides, fake XML tags, etc.)
+- `validate_policy_version()` — must be integer, strictly greater than current, within +1000 bound
+
+Why hard-reject, not sanitize-and-continue? An RM note is a short factual record — there's no legitimate reason for instruction-override phrasing. A hard block forces a human to re-enter in plain language.
+
+Validation is enforced at **both layers** — UI (`app.py` button handlers) and agent (`agents/human_review.py:62` calls `validate_rm_notes()` independently). This is defense-in-depth: even if a future caller bypasses the UI, the agent still validates.
+
 **Configurable Thresholds:**
 
 The `config` table stores runtime thresholds — confidence threshold (default 0.95), expiry threshold (default 30 days), automation pause toggle — all editable from the Streamlit sidebar without redeploying. This is the "Pause Automation" safety control that forces all cases to HUMAN review.
@@ -302,6 +332,7 @@ The `config` table stores runtime thresholds — confidence threshold (default 0
 | Observability | Console prints + SQLite audits | Structured logs, metrics, traces |
 | Auditability | `replay_audit()` in SQLite | Immutable append-only audit store |
 | Safety | "Pause Automation" toggle | Per-segment kill switches, staged rollout |
+| Security/Privacy | PII redaction + injection validation | RBAC, field-level encryption, access logging |
 
 ---
 
@@ -321,6 +352,10 @@ The `config` table stores runtime thresholds — confidence threshold (default 0
 | AI never contacts client | Safety — AI drafts, RM sends | `agents/communication.py:43-58` |
 | Per-node inline audit | Every action logged, not just terminal | `agents/audit.py:24-48` |
 | Pluggable LLM with template fallback | Works offline, upgradeable with one env var | `services/llm_client.py` |
+| PII redaction on LLM boundary | `beneficial_owner`/`tax_id` never reach the LLM | `services/privacy.py` |
+| Hardened system prompts | Anti-injection suffix on every LLM call | `services/privacy.py:22-27` |
+| Input validation (hard-reject) | Injection patterns blocked at UI + agent layer | `services/validation.py` |
+| Defense-in-depth validation | Both `app.py` and `human_review.py` validate independently | `app.py:181`, `agents/human_review.py:62` |
 
 ---
 
